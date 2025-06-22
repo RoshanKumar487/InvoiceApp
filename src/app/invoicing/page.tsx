@@ -1,4 +1,3 @@
-
 'use client';
 
 import React, { useState, useMemo, useEffect, type FormEvent, useCallback, useRef } from 'react';
@@ -16,7 +15,7 @@ import {
 } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
-import { Receipt, PlusCircle, Search, MoreHorizontal, Edit, Trash2, Eye, Mail, FileDown, Calendar as CalendarIconLucide, Save, Loader2, UserPlus, Printer } from 'lucide-react';
+import { Receipt, PlusCircle, Search, MoreHorizontal, Edit, Trash2, Eye, Mail, FileDown, Calendar as CalendarIconLucide, Save, Loader2, UserPlus, Printer, Percent } from 'lucide-react';
 import { format } from 'date-fns';
 import { useToast } from '@/hooks/use-toast';
 import {
@@ -52,6 +51,8 @@ import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
 import Image from 'next/image';
 import { sendInvoiceEmailAction } from './actions'; 
+import { cn } from '@/lib/utils';
+import { Separator } from '@/components/ui/separator';
 
 interface InvoiceItem {
   id: string;
@@ -60,13 +61,23 @@ interface InvoiceItem {
   unitPrice: number;
 }
 
+type DiscountType = 'fixed' | 'percentage';
+
 interface InvoiceFirestore {
   id?: string; 
   invoiceNumber: string;
   clientName: string;
   clientEmail?: string;
   clientAddress?: string;
-  amount: number;
+  
+  subtotal: number;
+  discountType: DiscountType;
+  discountValue: number;
+  discountAmount: number;
+  taxRate: number;
+  taxAmount: number;
+  amount: number; // This is the final total
+
   dueDate: Timestamp;
   status: 'Paid' | 'Pending' | 'Overdue' | 'Draft';
   issuedDate: Timestamp;
@@ -98,9 +109,16 @@ interface CompanyDetailsFirestore {
   phone: string;
   email: string;
   website: string;
+  accountNumber?: string;
+  ifscCode?: string;
 }
 
 const LOCAL_STORAGE_EMAIL_TEMPLATE_KEY = 'profitlens-invoice-email-template-v2';
+const LOCAL_STORAGE_NOTES_TEMPLATE_KEY = 'profitlens-invoice-notes-template-v1';
+const LOCAL_STORAGE_TAX_RATE_KEY = 'profitlens-invoice-tax-rate-v1';
+const LOCAL_STORAGE_DISCOUNT_TYPE_KEY = 'profitlens-invoice-discount-type-v1';
+const LOCAL_STORAGE_DISCOUNT_VALUE_KEY = 'profitlens-invoice-discount-value-v1';
+
 
 const getDefaultEmailBody = (currency: string) => `
 Dear {{clientName}},
@@ -118,6 +136,25 @@ Sincerely,
 `;
 
 const DEFAULT_EMAIL_SUBJECT_TEMPLATE = "Invoice {{invoiceNumber}} from {{companyName}}";
+
+const TopRightArt = () => (
+  <svg width="200" height="100" viewBox="0 0 200 100" className="absolute top-0 right-0 h-auto">
+    <path d="M100 0 L200 0 L200 100 Z" fill="#e3f2fd" />
+    <path d="M125 0 L200 0 L200 75 Z" fill="#bbdefb" />
+    <path d="M150 0 L200 0 L200 50 Z" fill="#90caf9" />
+    <path d="M175 0 L200 0 L200 25 Z" fill="#64b5f6" />
+  </svg>
+);
+
+const BottomLeftArt = () => (
+   <svg width="200" height="100" viewBox="0 0 200 100" className="absolute bottom-0 left-0 h-auto">
+    <path d="M0 0 L100 100 L0 100 Z" fill="#e3f2fd" />
+    <path d="M0 25 L75 100 L0 100 Z" fill="#bbdefb" />
+    <path d="M0 50 L50 100 L0 100 Z" fill="#90caf9" />
+    <path d="M0 75 L25 100 L0 100 Z" fill="#64b5f6" />
+  </svg>
+);
+
 
 export default function InvoicingPage() {
   const { user, isLoading: authIsLoading } = useAuth();
@@ -152,6 +189,35 @@ export default function InvoicingPage() {
   const [invoiceToView, setInvoiceToView] = useState<InvoiceDisplay | null>(null);
   const [isDownloadingPDF, setIsDownloadingPDF] = useState(false);
 
+  useEffect(() => {
+    if (!isFormOpen) return;
+
+    const subtotal = (currentInvoice.items || []).reduce((sum, item) => sum + (Number(item.quantity || 0) * Number(item.unitPrice || 0)), 0);
+
+    const discountValue = parseFloat(String(currentInvoice.discountValue) || '0');
+    let discountAmount = 0;
+    if (currentInvoice.discountType === 'percentage') {
+        discountAmount = subtotal * (discountValue / 100);
+    } else {
+        discountAmount = discountValue;
+    }
+
+    const taxRate = parseFloat(String(currentInvoice.taxRate) || '0');
+    const taxableAmount = subtotal - discountAmount;
+    const taxAmount = taxableAmount * (taxRate / 100);
+    
+    const total = taxableAmount + taxAmount;
+
+    setCurrentInvoice(prev => ({ 
+        ...prev, 
+        subtotal: isNaN(subtotal) ? 0 : subtotal,
+        discountAmount: isNaN(discountAmount) ? 0 : discountAmount,
+        taxAmount: isNaN(taxAmount) ? 0 : taxAmount,
+        amount: isNaN(total) ? 0 : total,
+    }));
+  }, [currentInvoice.items, currentInvoice.discountType, currentInvoice.discountValue, currentInvoice.taxRate, isFormOpen]);
+
+
   const fetchCompanyProfile = useCallback(async () => {
     if (user && user.companyId) {
       setIsFetchingCompanyProfile(true);
@@ -161,11 +227,11 @@ export default function InvoicingPage() {
         if (docSnap.exists()) {
           setCompanyProfileDetails(docSnap.data() as CompanyDetailsFirestore);
         } else {
-          setCompanyProfileDetails({ name: 'Your Company Name', address: 'Your Address', gstin: 'Your GSTIN', phone: '', email: '', website: '' });
+          setCompanyProfileDetails({ name: 'Your Company Name', address: 'Your Address', gstin: 'Your GSTIN', phone: '', email: '', website: '', accountNumber: '', ifscCode: '' });
         }
       } catch (error) {
         console.error("[InvoicingPage fetchCompanyProfile] Failed to fetch company details from Firestore:", error);
-        setCompanyProfileDetails({ name: 'Your Company Name', address: 'Your Address', gstin: 'Your GSTIN', phone: '', email: '', website: '' });
+        setCompanyProfileDetails({ name: 'Your Company Name', address: 'Your Address', gstin: 'Your GSTIN', phone: '', email: '', website: '', accountNumber: '', ifscCode: '' });
         toast({ title: "Error Fetching Company Info", description: "Could not load company details for invoices.", variant: "destructive" });
       } finally {
         setIsFetchingCompanyProfile(false);
@@ -194,27 +260,19 @@ export default function InvoicingPage() {
     }
     setIsLoading(true);
     try {
+      // Fetch Invoices
       const invoicesColRef = collection(db, 'invoices');
-      const q = query(invoicesColRef, where('companyId', '==', user.companyId), orderBy('createdAt', 'desc'));
-      const querySnapshot = await getDocs(q);
-
-      const fetchedInvoices = querySnapshot.docs.map(docSnap => {
+      const qInvoices = query(invoicesColRef, where('companyId', '==', user.companyId), orderBy('createdAt', 'desc'));
+      const invoiceSnapshot = await getDocs(qInvoices);
+      const fetchedInvoices = invoiceSnapshot.docs.map(docSnap => {
         const data = docSnap.data() as Omit<InvoiceFirestore, 'id'>;
         return {
-          id: docSnap.id,
-          invoiceNumber: data.invoiceNumber,
-          clientName: data.clientName,
-          clientEmail: data.clientEmail,
-          clientAddress: data.clientAddress,
-          amount: data.amount,
-          dueDate: data.dueDate.toDate(),
-          status: data.status,
-          issuedDate: data.issuedDate.toDate(),
-          items: data.items || [],
-          notes: data.notes || '',
+          id: docSnap.id, invoiceNumber: data.invoiceNumber, clientName: data.clientName, clientEmail: data.clientEmail, clientAddress: data.clientAddress,
+          subtotal: data.subtotal || 0, discountType: data.discountType || 'fixed', discountValue: data.discountValue || 0, discountAmount: data.discountAmount || 0,
+          taxRate: data.taxRate || 0, taxAmount: data.taxAmount || 0, amount: data.amount, dueDate: data.dueDate.toDate(), status: data.status,
+          issuedDate: data.issuedDate.toDate(), items: data.items || [], notes: data.notes || '',
         } as InvoiceDisplay;
       });
-
       setInvoices(fetchedInvoices);
 
       const clientsMap = new Map<string, ExistingClient>();
@@ -222,9 +280,7 @@ export default function InvoicingPage() {
         if (inv.clientName) {
             const existingEntry = clientsMap.get(inv.clientName.toLowerCase());
             clientsMap.set(inv.clientName.toLowerCase(), { 
-                name: inv.clientName, 
-                email: inv.clientEmail || existingEntry?.email || '',
-                address: inv.clientAddress || existingEntry?.address || ''
+                name: inv.clientName, email: inv.clientEmail || existingEntry?.email || '', address: inv.clientAddress || existingEntry?.address || ''
             });
         }
       });
@@ -232,13 +288,8 @@ export default function InvoicingPage() {
 
     } catch (error: any) {
       console.error('[InvoicingPage fetchInvoices] Error fetching invoices:', error);
-      toast({
-        title: 'Error Fetching Invoices',
-        description: `Could not load invoices. ${error.message || 'An unknown error occurred.'}`,
-        variant: 'destructive',
-      });
-      setInvoices([]);
-      setExistingClients([]);
+      toast({ title: 'Error Fetching Invoices', description: `Could not load invoices. ${error.message || 'An unknown error occurred.'}`, variant: 'destructive' });
+      setInvoices([]); setExistingClients([]);
     } finally {
       setIsLoading(false);
     }
@@ -246,17 +297,14 @@ export default function InvoicingPage() {
 
   useEffect(() => {
     if (authIsLoading) {
-      setIsLoading(true);
-      return;
+      setIsLoading(true); return;
     }
     if (!user || !user.companyId) {
-      setIsLoading(false);
-      setInvoices([]);
-      setExistingClients([]);
-      return;
+      setIsLoading(false); setInvoices([]); setExistingClients([]); return;
     }
     fetchInvoices();
   }, [user, authIsLoading, fetchInvoices]);
+
 
   const filteredInvoices = useMemo(() => {
     return invoices.filter(
@@ -306,7 +354,15 @@ export default function InvoicingPage() {
       clientName: currentInvoice.clientName!,
       clientEmail: currentInvoice.clientEmail || '', 
       clientAddress: currentInvoice.clientAddress || '',
-      amount: Number(currentInvoice.amount) || 0,
+      
+      subtotal: currentInvoice.subtotal || 0,
+      discountType: currentInvoice.discountType || 'fixed',
+      discountValue: Number(currentInvoice.discountValue) || 0,
+      discountAmount: currentInvoice.discountAmount || 0,
+      taxRate: Number(currentInvoice.taxRate) || 0,
+      taxAmount: currentInvoice.taxAmount || 0,
+      amount: Number(currentInvoice.amount) || 0, // This is the total
+
       issuedDate: issuedDateForFirestore,
       dueDate: dueDateForFirestore,
       status: currentInvoice.status || 'Draft',
@@ -333,6 +389,12 @@ export default function InvoicingPage() {
         });
         toast({ title: "Invoice Created", description: `Invoice ${newInvoiceNumber} created successfully.` });
       }
+      
+      // Save settings as default
+      localStorage.setItem(LOCAL_STORAGE_TAX_RATE_KEY, String(currentInvoice.taxRate || '0'));
+      localStorage.setItem(LOCAL_STORAGE_DISCOUNT_TYPE_KEY, currentInvoice.discountType || 'fixed');
+      localStorage.setItem(LOCAL_STORAGE_DISCOUNT_VALUE_KEY, String(currentInvoice.discountValue || '0'));
+
       fetchInvoices();
       setIsFormOpen(false);
       setCurrentInvoice({});
@@ -346,17 +408,29 @@ export default function InvoicingPage() {
   };
 
   const handleCreateNew = () => {
+    const savedNotes = localStorage.getItem(LOCAL_STORAGE_NOTES_TEMPLATE_KEY) || 'Full payment is due upon receipt. Late payments may incur additional charges.';
+    const savedTaxRate = parseFloat(localStorage.getItem(LOCAL_STORAGE_TAX_RATE_KEY) || '0');
+    const savedDiscountType = (localStorage.getItem(LOCAL_STORAGE_DISCOUNT_TYPE_KEY) as DiscountType) || 'fixed';
+    const savedDiscountValue = parseFloat(localStorage.getItem(LOCAL_STORAGE_DISCOUNT_VALUE_KEY) || '0');
+
+
     setCurrentInvoice({
         issuedDate: new Date(),
         dueDate: new Date(new Date().setDate(new Date().getDate() + 30)),
         status: 'Draft',
         items: [],
-        amount: 0,
         invoiceNumber: `INV${(Date.now()).toString().slice(-6)}`,
         clientName: '',
         clientEmail: '',
         clientAddress: '',
-        notes: '',
+        notes: savedNotes,
+        subtotal: 0,
+        discountType: savedDiscountType,
+        discountValue: savedDiscountValue,
+        discountAmount: 0,
+        taxRate: savedTaxRate,
+        taxAmount: 0,
+        amount: 0,
     });
     setIsEditing(false);
     setIsFormOpen(true);
@@ -402,62 +476,66 @@ export default function InvoicingPage() {
   };
 
   const handlePrintInvoice = () => {
-    const printContents = invoicePrintRef.current?.innerHTML;
-    if (printContents && typeof window !== 'undefined') {
-      const printWindow = window.open('', '_blank', 'height=800,width=800');
-      if (printWindow) {
-        printWindow.document.write('<html><head><title>Print Invoice</title>');
-        printWindow.document.write(`
-          <style>
-            body { font-family: 'PT Sans', sans-serif; margin: 20px; color: #333; }
-            .invoice-view-container { max-width: 750px; margin: auto; padding: 20px; border: 1px solid #eee; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-            img { max-width: 150px; margin-bottom: 20px; }
-            table { width: 100%; border-collapse: collapse; margin-bottom: 1rem; }
-            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; font-size: 0.9em; }
-            th { background-color: #f9f9f9; }
-            .text-right { text-align: right; }
-            .font-bold { font-weight: bold; }
-            .text-lg { font-size: 1.125rem; }
-            .text-2xl { font-size: 1.5rem; }
-            .text-4xl { font-size: 2.25rem; }
-            .mb-2 { margin-bottom: 0.5rem; } .mb-4 { margin-bottom: 1rem; } .mb-8 { margin-bottom: 2rem; }
-            .mt-2 { margin-top: 0.5rem; } .mt-4 { margin-top: 1rem; } .mt-8 { margin-top: 2rem; }
-            .grid { display: grid; } .grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .gap-8 { gap: 2rem; }
-            .items-start { align-items: flex-start; }
-            .p-4 { padding: 1rem; } .p-6 { padding: 1.5rem; }
-            .bg-muted-light { background-color: #f8f9fa; } 
-            .rounded-lg { border-radius: 0.5rem; }
-            .uppercase { text-transform: uppercase; }
-            .text-primary-print { color: #007bff; } 
-            .text-muted-foreground-print { color: #6c757d; }
-            .whitespace-pre-line { white-space: pre-line; }
-            .border { border: 1px solid #dee2e6; }
-            .border-t { border-top: 1px solid #dee2e6; }
-            .pt-2 { padding-top: 0.5rem; } .pt-8 { padding-top: 2rem; }
-            h1,h2,h3,h4 { margin-top:0; margin-bottom: 0.5rem; font-weight: 600; }
-            @media print {
-              body * { visibility: hidden; }
-              .printable-area, .printable-area * { visibility: visible; }
-              .printable-area { position: absolute; left: 0; top: 0; width: 100%; margin: 0; padding:0; border: none; box-shadow: none;}
-              .no-print { display: none !important; }
-              @page { margin: 20mm; size: auto; }
-            }
-          </style>
-        `);
-        printWindow.document.write('</head><body>');
-        printWindow.document.write(`<div class="printable-area">${printContents}</div>`);
-        printWindow.document.write('</body></html>');
-        printWindow.document.close();
-        printWindow.focus();
-        
-        setTimeout(() => {
-            printWindow.print();
-            printWindow.close();
-        }, 250);
+    if (!invoicePrintRef.current || !invoiceToView) return;
 
-      } else {
-        toast({ title: "Print Error", description: "Could not open print window. Please check pop-up blocker settings.", variant: "destructive"});
-      }
+    // Get all link tags with rel="stylesheet" from the main document head
+    const styleLinks = Array.from(document.querySelectorAll('link[rel="stylesheet"]'))
+      .map(link => link.outerHTML)
+      .join('');
+      
+    // Get all style tags from the main document head
+    const styleTags = Array.from(document.querySelectorAll('style'))
+      .map(style => style.outerHTML)
+      .join('');
+
+    // Get the HTML content of the invoice
+    const printContents = invoicePrintRef.current.outerHTML;
+    
+    const printWindow = window.open('', '_blank');
+
+    if (printWindow) {
+      printWindow.document.write(`
+        <html>
+          <head>
+            <title>Invoice ${invoiceToView.invoiceNumber}</title>
+            ${styleLinks}
+            ${styleTags}
+            <style>
+              @media print {
+                @page { size: A4; margin: 0; }
+                body { 
+                  -webkit-print-color-adjust: exact !important; 
+                  print-color-adjust: exact !important;
+                }
+              }
+            </style>
+          </head>
+          <body class="bg-white">
+            ${printContents}
+          </body>
+        </html>
+      `);
+
+      printWindow.document.close();
+      
+      // Use a timeout to ensure rendering is complete before printing
+      setTimeout(() => {
+        try {
+          printWindow.focus();
+          printWindow.print();
+        } catch (e) {
+          console.error("Print failed:", e);
+          toast({ title: "Print Failed", description: "There was an error opening the print dialog.", variant: "destructive"});
+          printWindow.close(); // Close only if printing fails
+        }
+      }, 500);
+
+    } else {
+      toast({
+        title: "Print Error",
+        description: "Could not open print window. Please check your pop-up blocker settings.",
+        variant: "destructive"
+      });
     }
   };
 
@@ -469,35 +547,17 @@ export default function InvoicingPage() {
         scale: 2, 
         useCORS: true,
         logging: false, 
-        onclone: (document) => { 
-            const clonedContainer = document.querySelector('.invoice-view-container');
-            if(clonedContainer) {
-              (clonedContainer as HTMLElement).style.border = 'none'; 
-              (clonedContainer as HTMLElement).style.boxShadow = 'none'; 
-            }
-        }
+        width: 794,
+        windowWidth: 794,
       });
       const imgData = canvas.toDataURL('image/png');
       const pdf = new jsPDF({
         orientation: 'portrait',
-        unit: 'pt', 
-        format: 'a4'
+        unit: 'px', 
+        format: [794, 1123] // A4 size in pixels at 96 DPI
       });
 
-      const pdfWidth = pdf.internal.pageSize.getWidth();
-      const pdfHeight = pdf.internal.pageSize.getHeight();
-      const imgProps = pdf.getImageProperties(imgData);
-      const imgWidth = imgProps.width;
-      const imgHeight = imgProps.height;
-      const ratio = Math.min(pdfWidth / imgWidth, pdfHeight / imgHeight);
-      
-      const newImgWidth = imgWidth * ratio;
-      const newImgHeight = imgHeight * ratio;
-      
-      const xOffset = (pdfWidth - newImgWidth) / 2;
-      const yOffset = (pdfHeight - newImgHeight) / 2;
-
-      pdf.addImage(imgData, 'PNG', xOffset, yOffset, newImgWidth, newImgHeight);
+      pdf.addImage(imgData, 'PNG', 0, 0, 794, 1123);
       pdf.save(`Invoice-${invoiceToView.invoiceNumber}.pdf`);
       toast({ title: "PDF Downloaded", description: `Invoice ${invoiceToView.invoiceNumber}.pdf downloaded.`});
     } catch (error) {
@@ -532,6 +592,8 @@ export default function InvoicingPage() {
     const companyPhone = company?.phone || '';
     const companyWebsite = company?.website || '';
     const companyGstin = company?.gstin || '';
+    const companyAccountNumber = company?.accountNumber || '';
+    const companyIfscCode = company?.ifscCode || '';
 
     const clientAddressHtml = invoice.clientAddress ? `<p style="margin:2px 0; font-size: 0.9em; white-space: pre-wrap;">${invoice.clientAddress.replace(/\n/g, '<br>')}</p>` : '';
     const statusBadgeStyle = `display: inline-block; padding: 4px 8px; font-size: 0.8em; border-radius: 4px; color: white; background-color: ${invoice.status === 'Paid' ? '#28a745' : invoice.status === 'Overdue' ? '#dc3545' : '#6c757d'};`;
@@ -580,14 +642,26 @@ export default function InvoicingPage() {
           </tbody>
         </table>
   
-        <div style="text-align: right; margin-bottom: 20px;">
-          <p style="font-size: 1.2em; font-weight: bold; margin:0;">Grand Total: ${currency}${invoice.amount.toFixed(2)}</p>
+        <div style="text-align: right; margin-bottom: 20px; padding-top: 10px; border-top: 1px solid #eee;">
+          <p style="margin: 2px 0;"><strong>Subtotal:</strong> ${currency}${invoice.subtotal.toFixed(2)}</p>
+          ${invoice.discountAmount > 0 ? `<p style="margin: 2px 0;"><strong>Discount:</strong> -${currency}${invoice.discountAmount.toFixed(2)}</p>` : ''}
+          ${invoice.taxAmount > 0 ? `<p style="margin: 2px 0;"><strong>Tax (${invoice.taxRate}%):</strong> +${currency}${invoice.taxAmount.toFixed(2)}</p>` : ''}
+          <p style="font-size: 1.2em; font-weight: bold; margin:5px 0 0 0; padding-top: 5px; border-top: 1px solid #333;"><strong>Grand Total:</strong> ${currency}${invoice.amount.toFixed(2)}</p>
         </div>
   
         ${invoice.notes ? `
           <div style="margin-bottom: 20px; padding: 10px; background-color: #f8f9fa; border-radius: 5px;">
             <h4 style="margin:0 0 5px 0; font-size: 1em;">Notes:</h4>
             <p style="margin:0; font-size: 0.9em; white-space: pre-wrap;">${invoice.notes}</p>
+          </div>
+        ` : ''}
+
+        ${companyAccountNumber ? `
+          <div style="margin-bottom: 20px; padding: 10px; background-color: #f8f9fa; border-radius: 5px;">
+            <h4 style="margin:0 0 5px 0; font-size: 1em;">Payment Details:</h4>
+            <p style="margin:0; font-size: 0.9em;"><strong>Account Name:</strong> ${companyName}</p>
+            <p style="margin:0; font-size: 0.9em;"><strong>Account Number:</strong> ${companyAccountNumber}</p>
+            ${companyIfscCode ? `<p style="margin:0; font-size: 0.9em;"><strong>IFSC/SWIFT Code:</strong> ${companyIfscCode}</p>` : ''}
           </div>
         ` : ''}
   
@@ -739,17 +813,6 @@ export default function InvoicingPage() {
     }));
   };
 
-  useEffect(() => {
-    if (currentInvoice.items && currentInvoice.items.length > 0) {
-      const totalAmount = currentInvoice.items.reduce((sum, item) => sum + (Number(item.quantity) * Number(item.unitPrice)), 0);
-      setCurrentInvoice(prev => ({ ...prev, amount: totalAmount }));
-    } else if ((currentInvoice.items || []).length === 0 ) {
-        if (currentInvoice.amount === undefined || currentInvoice.amount === null) {
-             setCurrentInvoice(prev => ({ ...prev, amount: 0}));
-        }
-    }
-  }, [currentInvoice.items]);
-
   const handleClientNameInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const typedValue = e.target.value;
     setCurrentInvoice(prev => ({
@@ -764,14 +827,36 @@ export default function InvoicingPage() {
   };
 
   const handleClientSuggestionClick = (client: ExistingClient) => {
-    setCurrentInvoice(prev => ({
-      ...prev,
-      clientName: client.name,
-      clientEmail: client.email || '',
-      clientAddress: client.address || '',
-    }));
+    const mostRecentInvoice = invoices
+      .filter(inv => inv.clientName === client.name)
+      .sort((a, b) => b.issuedDate.getTime() - a.issuedDate.getTime())[0];
+
+
+    if (mostRecentInvoice) {
+      // Create a new invoice draft based on the most recent one
+      setCurrentInvoice({
+        ...mostRecentInvoice,
+        id: undefined, // This is a new invoice, so no ID yet
+        invoiceNumber: `INV${(Date.now()).toString().slice(-6)}`, // Generate a new invoice number
+        issuedDate: new Date(),
+        dueDate: new Date(new Date().setDate(new Date().getDate() + 30)),
+        status: 'Draft',
+        // The rest of the fields (items, notes, tax, discount) are carried over
+      });
+    } else {
+      // Fallback for safety, though every existing client should have at least one invoice.
+      // This will just fill in client details if no past invoice is found for some reason.
+      setCurrentInvoice(prev => ({
+        ...prev,
+        clientName: client.name,
+        clientEmail: client.email || '',
+        clientAddress: client.address || '',
+      }));
+    }
+    
     setIsClientSuggestionsVisible(false);
   };
+
 
   const filteredClientSuggestions = useMemo(() => {
     const currentName = currentInvoice.clientName?.toLowerCase() || '';
@@ -788,9 +873,26 @@ export default function InvoicingPage() {
     return !existingClients.some(c => c.name.toLowerCase() === currentInvoice.clientName!.toLowerCase());
   }, [currentInvoice.clientName, existingClients]);
 
+  const handleSaveNotesAsDefault = useCallback(() => {
+    const notesToSave = currentInvoice.notes;
+    if (notesToSave && notesToSave.trim().length > 0) {
+        localStorage.setItem(LOCAL_STORAGE_NOTES_TEMPLATE_KEY, notesToSave);
+        toast({
+            title: "Default Notes Saved",
+            description: "Your notes will be used for new invoices.",
+        });
+    } else {
+        toast({
+            title: "Cannot Save Empty Notes",
+            description: "Please enter some text to save as a default.",
+            variant: "destructive",
+        });
+    }
+  }, [currentInvoice.notes, toast]);
+
   if (authIsLoading) {
     return (
-      <div className="flex items-center justify-center h-[calc(100vh-200px)]">
+      <div className="flex items-center justify-center h-[calc(100vh-200px)] p-4 sm:p-6 lg:p-8">
         <Loader2 className="h-12 w-12 animate-spin text-primary" />
         <p className="ml-2">Loading authentication...</p>
       </div>
@@ -799,7 +901,7 @@ export default function InvoicingPage() {
 
   if (!user && !authIsLoading) {
      return (
-      <div className="space-y-6">
+      <div className="space-y-6 p-4 sm:p-6 lg:p-8">
         <PageTitle title="Invoicing" subtitle="Manage your customer invoices efficiently." icon={Receipt} />
         <Card className="shadow-lg">
           <CardHeader><CardTitle>Access Denied</CardTitle></CardHeader>
@@ -810,7 +912,7 @@ export default function InvoicingPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 p-4 sm:p-6 lg:p-8">
       <PageTitle title="Invoicing" subtitle="Manage your customer invoices efficiently." icon={Receipt}>
         <Button onClick={handleCreateNew} disabled={isSaving || isLoading || isFetchingCompanyProfile}>
           <PlusCircle className="mr-2 h-4 w-4" /> Create New Invoice
@@ -837,7 +939,7 @@ export default function InvoicingPage() {
         <CardContent>
           {(isLoading || isFetchingCompanyProfile) && invoices.length === 0 && (
              <div className="flex items-center justify-center py-10">
-                <Loader2 className="h-8 w-8 animate-spin text-primary" />
+                <Loader2 className="h-8 w-8 animate-spin text-primary mx-auto" />
                 <span className="ml-2">Loading data...</span>
             </div>
           )}
@@ -899,7 +1001,7 @@ export default function InvoicingPage() {
       </Card>
 
       <Dialog open={isFormOpen} onOpenChange={(open) => { setIsFormOpen(open); if (!open) { setCurrentInvoice({}); setIsEditing(false); setIsClientSuggestionsVisible(false); } }}>
-        <DialogContent className="sm:max-w-2xl max-h-[90vh] flex flex-col">
+        <DialogContent className="sm:max-w-3xl max-h-[90vh] flex flex-col">
           <DialogHeader>
             <DialogTitle className="font-headline">{isEditing ? 'Edit Invoice' : 'Create New Invoice'}</DialogTitle>
             <DialogDescription>
@@ -907,6 +1009,7 @@ export default function InvoicingPage() {
             </DialogDescription>
           </DialogHeader>
           <form onSubmit={handleFormSubmit} id="invoice-form-explicit" className="space-y-4 overflow-y-auto flex-grow p-1 pr-3">
+            
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
                     <Label htmlFor="clientName">Client Name</Label>
@@ -917,7 +1020,6 @@ export default function InvoicingPage() {
                             onChange={handleClientNameInputChange}
                             onFocus={() => { if ((currentInvoice.clientName || '').length > 0) setIsClientSuggestionsVisible(true); }}
                             onBlur={() => {
-                                // Delay closing to allow click on suggestions
                                 setTimeout(() => {
                                     setIsClientSuggestionsVisible(false);
                                 }, 150);
@@ -980,7 +1082,7 @@ export default function InvoicingPage() {
                 />
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                  <div>
                     <Label htmlFor="invoiceNumber">Invoice Number</Label>
                     <Input id="invoiceNumber" value={currentInvoice.invoiceNumber || ''} onChange={(e) => setCurrentInvoice({ ...currentInvoice, invoiceNumber: e.target.value })} required disabled={isSaving || isEditing} />
@@ -1023,14 +1125,16 @@ export default function InvoicingPage() {
                 </div>
             </div>
 
+            <Separator/>
+
             <div className="space-y-2 pt-2">
               <div className="flex justify-between items-center">
-                <Label>Invoice Items</Label>
+                <Label className="text-base font-medium">Invoice Items</Label>
                 <Button type="button" variant="outline" size="sm" onClick={handleAddItem} disabled={isSaving}><PlusCircle className="mr-2 h-4 w-4" /> Add Item</Button>
               </div>
               {(currentInvoice.items || []).map((item) => (
-                <div key={item.id} className="flex gap-2 items-end p-2 border rounded-md bg-muted/30">
-                  <div className="flex-grow space-y-1">
+                <div key={item.id} className="grid grid-cols-[1fr_auto_auto_auto] gap-2 items-end p-2 border rounded-md bg-muted/30">
+                  <div className="space-y-1">
                     <Label htmlFor={`item-desc-${item.id}`} className="text-xs">Description</Label>
                     <Input id={`item-desc-${item.id}`} value={item.description} onChange={e => handleItemChange(item.id, 'description', e.target.value)} placeholder="Service or Product" disabled={isSaving} />
                   </div>
@@ -1048,14 +1152,62 @@ export default function InvoicingPage() {
                { (currentInvoice.items || []).length === 0 && <p className="text-xs text-muted-foreground text-center py-2">No items added. Total amount can be set manually.</p>}
             </div>
 
-            <div>
-                <Label htmlFor="amount">Total Amount ({currency})</Label>
-                <Input id="amount" type="number" value={currentInvoice.amount === undefined || currentInvoice.amount === null ? '' : currentInvoice.amount.toFixed(2)} onChange={(e) => setCurrentInvoice({ ...currentInvoice, amount: parseFloat(e.target.value) || 0 })} placeholder="Calculated if items exist, or set manually" disabled={(currentInvoice.items || []).length > 0 || isSaving} required min="0" step="0.01" />
+            <Separator/>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-4">
+                <div className="space-y-4">
+                    <div className="grid grid-cols-2 gap-2">
+                        <div>
+                            <Label htmlFor="discountType">Discount Type</Label>
+                             <Select value={currentInvoice.discountType || 'fixed'} onValueChange={(value: DiscountType) => setCurrentInvoice(prev => ({ ...prev, discountType: value }))} disabled={isSaving}>
+                                <SelectTrigger><SelectValue/></SelectTrigger>
+                                <SelectContent>
+                                    <SelectItem value="fixed">Fixed ({currency})</SelectItem>
+                                    <SelectItem value="percentage">Percentage (%)</SelectItem>
+                                </SelectContent>
+                            </Select>
+                        </div>
+                        <div>
+                            <Label htmlFor="discountValue">Discount Value</Label>
+                            <Input id="discountValue" type="number" value={currentInvoice.discountValue || ''} onChange={(e) => setCurrentInvoice(prev => ({...prev, discountValue: e.target.value}))} min="0" step="0.01" disabled={isSaving} />
+                        </div>
+                    </div>
+                    <div>
+                        <Label htmlFor="taxRate">Tax Rate (%)</Label>
+                        <Input id="taxRate" type="number" value={currentInvoice.taxRate || ''} onChange={(e) => setCurrentInvoice(prev => ({...prev, taxRate: e.target.value}))} min="0" step="0.01" placeholder="e.g. 5 or 12.5" disabled={isSaving} />
+                    </div>
+                </div>
+
+                <div className="space-y-2 p-4 bg-muted/50 rounded-lg">
+                    <h4 className="font-medium text-center mb-2">Summary</h4>
+                    <div className="flex justify-between text-sm">
+                        <span className="text-muted-foreground">Subtotal:</span>
+                        <span className="font-medium">{currency}{(currentInvoice.subtotal || 0).toFixed(2)}</span>
+                    </div>
+                    <div className="flex justify-between text-sm">
+                        <span className="text-muted-foreground">Discount:</span>
+                        <span className="font-medium text-destructive">- {currency}{(currentInvoice.discountAmount || 0).toFixed(2)}</span>
+                    </div>
+                    <div className="flex justify-between text-sm">
+                        <span className="text-muted-foreground">Tax ({currentInvoice.taxRate || 0}%):</span>
+                        <span className="font-medium text-green-600">+ {currency}{(currentInvoice.taxAmount || 0).toFixed(2)}</span>
+                    </div>
+                    <Separator className="my-2" />
+                    <div className="flex justify-between text-lg font-bold">
+                        <span>Grand Total:</span>
+                        <span>{currency}{(currentInvoice.amount || 0).toFixed(2)}</span>
+                    </div>
+                </div>
             </div>
 
             <div>
-                <Label htmlFor="notes">Notes (Optional)</Label>
-                <Textarea id="notes" value={currentInvoice.notes || ''} onChange={(e) => setCurrentInvoice({ ...currentInvoice, notes: e.target.value })} placeholder="e.g., Payment terms, thank you message" disabled={isSaving} />
+              <div className="flex justify-between items-center mb-1">
+                <Label htmlFor="notes">Notes / Terms &amp; Conditions (Optional)</Label>
+                <Button type="button" variant="link" size="sm" className="h-auto p-0 text-xs" onClick={handleSaveNotesAsDefault} disabled={isSaving}>
+                    Save as Default
+                </Button>
+              </div>
+              <Textarea id="notes" value={currentInvoice.notes || ''} onChange={(e) => setCurrentInvoice({ ...currentInvoice, notes: e.target.value })} placeholder="e.g., Payment terms, thank you message" disabled={isSaving} />
             </div>
 
           </form>
@@ -1071,103 +1223,141 @@ export default function InvoicingPage() {
       </Dialog>
 
       <Dialog open={isViewInvoiceDialogOpen} onOpenChange={(open) => { setIsViewInvoiceDialogOpen(open); if (!open) setInvoiceToView(null); }}>
-        <DialogContent className="sm:max-w-4xl max-h-[90vh] flex flex-col p-0">
-          <DialogHeader className="p-6 pb-0">
-            <DialogTitle className="font-headline text-2xl">Invoice Details</DialogTitle>
-            <DialogDescription>
-              Viewing Invoice {invoiceToView?.invoiceNumber}. Use actions below to print or download.
-            </DialogDescription>
-          </DialogHeader>
+        <DialogContent className="sm:max-w-5xl max-h-[90vh] flex flex-col p-0 bg-gray-100 dark:bg-background">
+            <DialogHeader className="p-4 sm:p-6 pb-2 border-b bg-background no-print">
+                <DialogTitle className="font-headline text-xl">
+                    Invoice {invoiceToView?.invoiceNumber}
+                </DialogTitle>
+            </DialogHeader>
           
-          <ScrollArea className="flex-grow overflow-y-auto">
-            <div ref={invoicePrintRef} className="invoice-view-container p-6 bg-card text-card-foreground">
-              {isFetchingCompanyProfile && <div className="text-center p-10"><Loader2 className="h-8 w-8 animate-spin text-primary mx-auto" /> <p>Loading company details...</p></div>}
-              {!isFetchingCompanyProfile && invoiceToView && companyProfileDetails && (
-                <>
-                  <header className="mb-8">
-                    <div className="grid grid-cols-2 gap-8 items-start">
-                      <div>
-                         <Image src="https://placehold.co/200x80.png?text=Your+Logo" alt="Company Logo" width={150} height={60} className="mb-4" data-ai-hint="company logo" />
-                        <h2 className="text-2xl font-bold text-primary">{companyProfileDetails.name}</h2>
-                        <p className="text-sm text-muted-foreground whitespace-pre-line">{companyProfileDetails.address}</p>
-                        {companyProfileDetails.email && <p className="text-sm text-muted-foreground">Email: {companyProfileDetails.email}</p>}
-                        {companyProfileDetails.phone && <p className="text-sm text-muted-foreground">Phone: {companyProfileDetails.phone}</p>}
-                        {companyProfileDetails.website && <p className="text-sm text-muted-foreground">Website: <a href={companyProfileDetails.website} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">{companyProfileDetails.website}</a></p>}
-                        {companyProfileDetails.gstin && <p className="text-sm text-muted-foreground">GSTIN/Tax ID: {companyProfileDetails.gstin}</p>}
-                      </div>
-                      <div className="text-right">
-                        <h1 className="text-4xl font-bold uppercase text-foreground mb-2">Invoice</h1>
-                        <p className="text-md"><span className="font-semibold">Invoice #:</span> {invoiceToView.invoiceNumber}</p>
-                        <p className="text-md"><span className="font-semibold">Date Issued:</span> {format(invoiceToView.issuedDate, 'PPP')}</p>
-                        <p className="text-md"><span className="font-semibold">Date Due:</span> {format(invoiceToView.dueDate, 'PPP')}</p>
-                        <Badge variant={getStatusBadgeVariant(invoiceToView.status)} className={`mt-2 text-sm px-3 py-1 ${invoiceToView.status === 'Paid' ? 'bg-accent text-accent-foreground' : invoiceToView.status === 'Overdue' ? 'bg-destructive text-destructive-foreground' : ''}`}>
-                          {invoiceToView.status}
-                        </Badge>
-                      </div>
+            <ScrollArea className="flex-grow overflow-y-auto bg-gray-100 dark:bg-background">
+                {isFetchingCompanyProfile && <div className="text-center p-10"><Loader2 className="h-8 w-8 animate-spin text-primary mx-auto" /> <p>Loading company details...</p></div>}
+                {!isFetchingCompanyProfile && invoiceToView && companyProfileDetails && (
+                    <div ref={invoicePrintRef} className="invoice-view-container relative p-12 sm:p-16 text-[#333] font-sans bg-white min-h-[1123px] w-[794px] mx-auto my-4 shadow-lg overflow-hidden border border-gray-200">
+                        <TopRightArt />
+                        <BottomLeftArt />
+                        <div className="relative z-10">
+                            <header className="flex justify-between items-start mb-8">
+                                <div>
+                                <h2 className="text-2xl font-bold text-gray-800">{companyProfileDetails.name}</h2>
+                                <p className="text-sm text-gray-500 whitespace-pre-line">{companyProfileDetails.address}</p>
+                                </div>
+                                <div className="text-right">
+                                <h1 className="text-5xl font-light text-[#2962ff] tracking-wider">INVOICE</h1>
+                                </div>
+                            </header>
+
+                            <section className="flex justify-between border-y border-gray-200 py-4 mb-8">
+                                <div className="grid grid-cols-[max-content,1fr] gap-x-6 gap-y-1 text-sm">
+                                <span className="font-semibold text-gray-500">Invoice#</span>
+                                <span className="font-bold">{invoiceToView.invoiceNumber}</span>
+                                <span className="font-semibold text-gray-500">Invoice Date</span>
+                                <span>{format(invoiceToView.issuedDate, 'dd MMM yyyy')}</span>
+                                <span className="font-semibold text-gray-500">Terms</span>
+                                <span>Due on Receipt</span>
+                                <span className="font-semibold text-gray-500">Due Date</span>
+                                <span>{format(invoiceToView.dueDate, 'dd MMM yyyy')}</span>
+                                </div>
+                            </section>
+
+                            <section className="grid grid-cols-2 gap-8 mb-8">
+                                <div>
+                                    <div className="border-b border-gray-200 pb-1 mb-2">
+                                        <h3 className="text-sm font-semibold text-gray-600">Bill To</h3>
+                                    </div>
+                                    <p className="font-bold">{invoiceToView.clientName}</p>
+                                    <p className="text-sm text-gray-600 whitespace-pre-line">{invoiceToView.clientAddress}</p>
+                                </div>
+                                <div>
+                                    <div className="border-b border-gray-200 pb-1 mb-2">
+                                        <h3 className="text-sm font-semibold text-gray-600">Ship To</h3>
+                                    </div>
+                                    <p className="font-bold">{invoiceToView.clientName}</p>
+                                    <p className="text-sm text-gray-600 whitespace-pre-line">{invoiceToView.clientAddress}</p>
+                                </div>
+                            </section>
+
+                            <section>
+                                <table className="w-full text-left border-collapse">
+                                    <thead>
+                                        <tr style={{ backgroundColor: '#1e4e8c', color: 'white' }}>
+                                            <th className="p-3 w-12 text-center font-normal">#</th>
+                                            <th className="p-3 font-normal">Item &amp; Description</th>
+                                            <th className="p-3 w-24 text-right font-normal">Qty</th>
+                                            <th className="p-3 w-32 text-right font-normal">Rate</th>
+                                            <th className="p-3 w-32 text-right font-normal">Amount</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                    {(invoiceToView.items || []).map((item, index) => (
+                                        <tr key={item.id} className="border-b border-gray-200">
+                                            <td className="p-3 text-center text-gray-600">{index + 1}</td>
+                                            <td className="p-3">
+                                                <p className="font-semibold text-gray-800">{item.description}</p>
+                                            </td>
+                                            <td className="p-3 text-right text-gray-600">{item.quantity.toFixed(2)}</td>
+                                            <td className="p-3 text-right text-gray-600">{currency}{item.unitPrice.toFixed(2)}</td>
+                                            <td className="p-3 text-right font-semibold text-gray-800">{currency}{(item.quantity * item.unitPrice).toFixed(2)}</td>
+                                        </tr>
+                                    ))}
+                                    {(!invoiceToView.items || invoiceToView.items.length === 0) && (
+                                        <TableRow><TableCell colSpan={5} className="text-center text-gray-500 py-4">No line items for this invoice.</TableCell></TableRow>
+                                    )}
+                                    </tbody>
+                                </table>
+                            </section>
+
+                            <footer className="mt-8">
+                                <div className="text-right mb-4 border-t border-gray-200 pt-2">
+                                    <span className="font-semibold text-gray-600 mr-4">Sub Total</span>
+                                    <span className="font-semibold text-gray-800">{currency}{invoiceToView.subtotal.toFixed(2)}</span>
+                                </div>
+                                <div className="grid grid-cols-2 gap-8">
+                                    <div className="text-sm text-gray-600">
+                                        <p className="font-semibold text-gray-700">Thanks for shopping with us.</p>
+                                        {invoiceToView.notes && <p className="mt-1">{invoiceToView.notes}</p>}
+
+                                        {companyProfileDetails.accountNumber && (
+                                            <div className="mt-4">
+                                                <p className="font-bold text-gray-800">Payment Details</p>
+                                                <p className="text-xs">Account Name: {companyProfileDetails.name}</p>
+                                                <p className="text-xs">Account Number: {companyProfileDetails.accountNumber}</p>
+                                                {companyProfileDetails.ifscCode && <p className="text-xs">IFSC/SWIFT: {companyProfileDetails.ifscCode}</p>}
+                                            </div>
+                                        )}
+                                        
+                                        <p className="font-bold mt-4 text-gray-800">Terms &amp; Conditions</p>
+                                        <p className="text-xs">Full payment is due upon receipt of this invoice. Late payments may incur additional charges or interest as per the applicable laws.</p>
+                                    </div>
+                                    <div className="self-end">
+                                        <table className="w-full text-right" style={{ backgroundColor: '#e3f2fd' }}>
+                                            <tbody>
+                                                <tr>
+                                                    <td className="p-3 font-semibold text-gray-700">Tax Rate</td>
+                                                    <td className="p-3 font-semibold text-gray-800">{invoiceToView.taxRate.toFixed(2)}%</td>
+                                                </tr>
+                                                <tr className="font-bold text-lg">
+                                                    <td className="p-3 text-gray-800">Total</td>
+                                                    <td className="p-3 text-gray-900">{currency}{invoiceToView.amount.toFixed(2)}</td>
+                                                </tr>
+                                                <tr className="font-bold text-lg">
+                                                    <td className="p-3 text-gray-800">Balance Due</td>
+                                                    <td className="p-3 text-gray-900">{currency}{invoiceToView.amount.toFixed(2)}</td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                                <div className="text-center text-xs text-gray-400 pt-12 mt-8 border-t border-gray-100">
+                                    <p>Invoice created by ProfitLens. Please visit <a href="https://www.profitlens.com" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">www.profitlens.com</a>.</p>
+                                </div>
+                            </footer>
+                        </div>
                     </div>
-                  </header>
-
-                  <section className="mb-8 p-4 bg-muted/30 rounded-lg">
-                    <h3 className="text-lg font-semibold text-foreground mb-2">Bill To:</h3>
-                    <p className="font-medium text-foreground">{invoiceToView.clientName}</p>
-                    {invoiceToView.clientEmail && <p className="text-sm text-muted-foreground">{invoiceToView.clientEmail}</p>}
-                    {invoiceToView.clientAddress && <p className="text-sm text-muted-foreground whitespace-pre-line">{invoiceToView.clientAddress}</p>}
-                  </section>
-
-                  <section className="mb-8">
-                    <Table className="border">
-                      <TableHeader className="bg-muted/50">
-                        <TableRow>
-                          <TableHead className="w-[50px]">#</TableHead>
-                          <TableHead>Description</TableHead>
-                          <TableHead className="text-right">Quantity</TableHead>
-                          <TableHead className="text-right">Unit Price</TableHead>
-                          <TableHead className="text-right">Amount</TableHead>
-                        </TableRow>
-                      </TableHeader>
-                      <TableBody>
-                        {(invoiceToView.items || []).map((item, index) => (
-                          <TableRow key={item.id}>
-                            <TableCell>{index + 1}</TableCell>
-                            <TableCell>{item.description}</TableCell>
-                            <TableCell className="text-right">{item.quantity}</TableCell>
-                            <TableCell className="text-right">{currency}{item.unitPrice.toFixed(2)}</TableCell>
-                            <TableCell className="text-right font-medium">{currency}{(item.quantity * item.unitPrice).toFixed(2)}</TableCell>
-                          </TableRow>
-                        ))}
-                        {(!invoiceToView.items || invoiceToView.items.length === 0) && (
-                           <TableRow><TableCell colSpan={5} className="text-center text-muted-foreground py-4">No line items for this invoice.</TableCell></TableRow>
-                        )}
-                      </TableBody>
-                    </Table>
-                  </section>
-                  
-                  <section className="flex justify-end mb-8">
-                    <div className="w-full max-w-xs space-y-2">
-                       <div className="flex justify-between items-center border-t pt-2">
-                         <p className="text-lg font-semibold text-foreground">Grand Total:</p>
-                         <p className="text-lg font-bold text-primary">{currency}{invoiceToView.amount.toFixed(2)}</p>
-                       </div>
-                    </div>
-                  </section>
-
-                  {invoiceToView.notes && (
-                    <section className="mb-8 p-4 bg-muted/30 rounded-lg">
-                      <h4 className="font-semibold text-foreground mb-1">Notes:</h4>
-                      <p className="text-sm text-muted-foreground whitespace-pre-wrap">{invoiceToView.notes}</p>
-                    </section>
-                  )}
-
-                  <footer className="text-center text-sm text-muted-foreground pt-8 border-t">
-                    <p>Thank you for your business!</p>
-                    <p>{companyProfileDetails.name} - Payment is due by {format(invoiceToView.dueDate, 'PPP')}.</p>
-                  </footer>
-                </>
-              )}
-            </div>
-          </ScrollArea>
+                )}
+            </ScrollArea>
           
-          <DialogFooter className="p-6 border-t bg-background no-print">
+          <DialogFooter className="p-4 sm:p-6 border-t bg-background no-print">
              <Button type="button" variant="outline" onClick={handlePrintInvoice} disabled={isDownloadingPDF}>
                 <Printer className="mr-2 h-4 w-4" /> Print Invoice
              </Button>
@@ -1231,7 +1421,7 @@ export default function InvoicingPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-
+      
       <AlertDialog open={isDeleteDialogOpen} onOpenChange={setIsDeleteDialogOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>

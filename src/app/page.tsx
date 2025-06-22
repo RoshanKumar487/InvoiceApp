@@ -1,157 +1,259 @@
+
 'use client';
+
+import React, { useState, useEffect } from 'react';
+import { useAuth } from '@/contexts/AuthContext';
+import { db } from '@/lib/firebaseConfig';
+import { collection, query, where, getDocs, orderBy, limit, Timestamp } from 'firebase/firestore';
+import { format, subMonths } from 'date-fns';
+import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, Legend } from 'recharts';
 
 import PageTitle from '@/components/PageTitle';
 import DataCard from '@/components/DataCard';
-import { DollarSign, TrendingUp, TrendingDown, Users, Activity, BarChartBig, FileText } from 'lucide-react'; // Removed Lightbulb as it's now in HelpfulTipsCard
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'; // Added CardDescription
-import { ResponsiveContainer, BarChart, XAxis, YAxis, Tooltip, Legend, Bar, CartesianGrid } from 'recharts';
-import dynamic from 'next/dynamic';
-import { Skeleton } from '@/components/ui/skeleton'; // For loading state
-import { useAuth } from '@/contexts/AuthContext';
+import TransactionPieChart from '@/components/dashboard/TransactionPieChart';
+import HelpfulTipsCard from '@/components/dashboard/HelpfulTipsCard';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow, TableCaption } from '@/components/ui/table';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Badge } from '@/components/ui/badge';
+import { TrendingUp, TrendingDown, Users, Wallet, LayoutDashboard } from 'lucide-react';
 
+interface FinancialData {
+  totalRevenue: number;
+  totalExpenses: number;
+  netProfit: number;
+  employeeCount: number;
+}
 
-const mockChartData = [
-  { name: 'Jan', revenue: 4000, expenses: 2400 },
-  { name: 'Feb', revenue: 3000, expenses: 1398 },
-  { name: 'Mar', revenue: 2000, expenses: 9800 },
-  { name: 'Apr', revenue: 2780, expenses: 3908 },
-  { name: 'May', revenue: 1890, expenses: 4800 },
-  { name: 'Jun', revenue: 2390, expenses: 3800 },
-];
+interface MonthlyData {
+  month: string;
+  revenue: number;
+  expenses: number;
+}
 
-const mockRecentActivity = [
-  { id: 1, description: 'Invoice #INV001 paid', time: '2 hours ago', type: 'payment' },
-  { id: 2, description: 'New expense "Office Supplies" recorded', time: '5 hours ago', type: 'expense' },
-  { id: 3, description: 'Appointment with "Client X" scheduled', time: '1 day ago', type: 'calendar' },
-];
-
-const HelpfulTipsCardSkeleton = () => (
-  <Card className="shadow-lg">
-    <CardHeader>
-      <Skeleton className="h-6 w-3/4 rounded" /> 
-      <Skeleton className="h-4 w-1/2 rounded mt-1" /> 
-    </CardHeader>
-    <CardContent className="space-y-3">
-      <div className="flex items-start gap-3">
-        <Skeleton className="h-5 w-5 rounded-full" /> 
-        <Skeleton className="h-4 flex-grow rounded" /> 
-      </div>
-      <div className="flex items-start gap-3">
-        <Skeleton className="h-5 w-5 rounded-full" />
-        <Skeleton className="h-4 flex-grow rounded" />
-      </div>
-      <div className="flex items-start gap-3">
-        <Skeleton className="h-5 w-5 rounded-full" />
-        <Skeleton className="h-4 flex-grow rounded" />
-      </div>
-      <Skeleton className="h-[200px] w-full rounded-lg mt-4" /> 
-    </CardContent>
-  </Card>
-);
-
-const HelpfulTipsCard = dynamic(() => import('@/components/dashboard/HelpfulTipsCard'), {
-  loading: () => <HelpfulTipsCardSkeleton />,
-});
-
+interface RecentActivity {
+  id: string;
+  type: 'invoice' | 'expense';
+  description: string;
+  amount: number;
+  date: Date;
+  status?: string;
+}
 
 export default function DashboardPage() {
-  const { user } = useAuth();
-  const currency = user?.currencySymbol || '$';
+  const { user, currencySymbol, isLoading: authIsLoading } = useAuth();
+  const [financialData, setFinancialData] = useState<FinancialData | null>(null);
+  const [monthlyChartData, setMonthlyChartData] = useState<MonthlyData[]>([]);
+  const [recentActivity, setRecentActivity] = useState<RecentActivity[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
 
-  // Placeholder data
-  const revenue = "12,345.67";
-  const expenses = "5,678.90";
-  const profit = "6,666.77";
-  const newCustomers = "12";
-  const activeProjects = "5";
+  useEffect(() => {
+    if (!user || !user.companyId) {
+      setIsLoading(false);
+      return;
+    }
+
+    const fetchData = async () => {
+      setIsLoading(true);
+      const companyId = user.companyId;
+
+      try {
+        // Fetch financial data
+        const revenueQuery = query(collection(db, 'revenueEntries'), where('companyId', '==', companyId));
+        const expensesQuery = query(collection(db, 'expenses'), where('companyId', '==', companyId));
+        const employeesQuery = query(collection(db, 'employees'), where('companyId', '==', companyId));
+        const invoicesQuery = query(collection(db, 'invoices'), where('companyId', '==', companyId), orderBy('issuedDate', 'desc'), limit(3));
+        const recentExpensesQuery = query(collection(db, 'expenses'), where('companyId', '==', companyId), orderBy('date', 'desc'), limit(3));
+
+        const [revenueSnapshot, expensesSnapshot, employeesSnapshot, invoicesSnapshot, recentExpensesSnapshot] = await Promise.all([
+          getDocs(revenueQuery),
+          getDocs(expensesQuery),
+          getDocs(employeesQuery),
+          getDocs(invoicesQuery),
+          getDocs(recentExpensesQuery),
+        ]);
+
+        let totalRevenue = 0;
+        const revenueByMonth: { [key: string]: number } = {};
+        revenueSnapshot.forEach(doc => {
+          const data = doc.data();
+          totalRevenue += data.amount;
+          const month = format(data.date.toDate(), 'MMM yyyy');
+          revenueByMonth[month] = (revenueByMonth[month] || 0) + data.amount;
+        });
+
+        let totalExpenses = 0;
+        const expensesByMonth: { [key: string]: number } = {};
+        expensesSnapshot.forEach(doc => {
+          const data = doc.data();
+          totalExpenses += data.amount;
+          const month = format(data.date.toDate(), 'MMM yyyy');
+          expensesByMonth[month] = (expensesByMonth[month] || 0) + data.amount;
+        });
+
+        const employeeCount = employeesSnapshot.size;
+        const netProfit = totalRevenue - totalExpenses;
+
+        setFinancialData({ totalRevenue, totalExpenses, netProfit, employeeCount });
+
+        // Prepare chart data for the last 6 months
+        const months = Array.from({ length: 6 }, (_, i) => format(subMonths(new Date(), i), 'MMM yyyy')).reverse();
+        const chartData = months.map(month => ({
+          month,
+          revenue: revenueByMonth[month] || 0,
+          expenses: expensesByMonth[month] || 0,
+        }));
+        setMonthlyChartData(chartData);
+        
+        // Prepare recent activity feed
+        const invoiceActivities = invoicesSnapshot.docs.map(doc => ({
+          id: doc.id,
+          type: 'invoice' as const,
+          description: `Invoice #${doc.data().invoiceNumber} to ${doc.data().clientName}`,
+          amount: doc.data().amount,
+          date: (doc.data().issuedDate as Timestamp).toDate(),
+          status: doc.data().status
+        }));
+        const expenseActivities = recentExpensesSnapshot.docs.map(doc => ({
+            id: doc.id,
+            type: 'expense' as const,
+            description: doc.data().description || doc.data().category,
+            amount: doc.data().amount,
+            date: (doc.data().date as Timestamp).toDate(),
+            status: 'Expense'
+        }));
+        
+        const combinedActivities = [...invoiceActivities, ...expenseActivities]
+            .sort((a, b) => b.date.getTime() - a.date.getTime())
+            .slice(0, 5);
+
+        setRecentActivity(combinedActivities);
+
+      } catch (error) {
+        console.error("Error fetching dashboard data:", error);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    fetchData();
+  }, [user]);
+
+  const getStatusBadgeVariant = (status?: string) => {
+    switch (status) {
+      case 'Paid':
+        return 'bg-green-100 text-green-800 border-green-200';
+      case 'Pending':
+        return 'bg-yellow-100 text-yellow-800 border-yellow-200';
+      case 'Overdue':
+        return 'bg-red-100 text-red-800 border-red-200';
+      case 'Expense':
+        return 'bg-blue-100 text-blue-800 border-blue-200';
+      default:
+        return 'bg-gray-100 text-gray-800 border-gray-200';
+    }
+  };
+
+
+  if (authIsLoading || isLoading) {
+    return (
+      <div className="p-4 sm:p-6 lg:p-8">
+        <PageTitle title="Dashboard" icon={LayoutDashboard} />
+        <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-4">
+          <Skeleton className="h-[126px]" />
+          <Skeleton className="h-[126px]" />
+          <Skeleton className="h-[126px]" />
+          <Skeleton className="h-[126px]" />
+        </div>
+        <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3 mt-6">
+            <Skeleton className="lg:col-span-2 h-[450px]" />
+            <Skeleton className="lg:col-span-1 h-[450px]" />
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="space-y-6 sm:space-y-8">
-      <PageTitle title="Dashboard" subtitle="Overview of your business performance." icon={BarChartBig} />
+    <div className="p-4 sm:p-6 lg:p-8 space-y-6">
+      <PageTitle title="Dashboard" subtitle="An overview of your business's financial health." icon={LayoutDashboard} />
 
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-3">
-        <DataCard title="Total Revenue" value={`${currency}${revenue}`} icon={DollarSign} trend="up" trendValue="+15.2% from last month" className="bg-gradient-to-br from-green-50 to-green-100 border-green-300 dark:from-green-900/50 dark:to-green-950/50 dark:border-green-700" />
-        <DataCard title="Total Expenses" value={`${currency}${expenses}`} icon={TrendingDown} trend="down" trendValue="-3.5% from last month" className="bg-gradient-to-br from-red-50 to-red-100 border-red-300 dark:from-red-900/50 dark:to-red-950/50 dark:border-red-700" />
-        <DataCard title="Net Profit" value={`${currency}${profit}`} icon={TrendingUp} trend="up" trendValue="+20.1% from last month" className="bg-gradient-to-br from-green-50 to-green-100 border-green-300 dark:from-green-900/50 dark:to-green-950/50 dark:border-green-700" />
+      <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-4">
+        <DataCard title="Total Revenue" value={`${currencySymbol}${(financialData?.totalRevenue ?? 0).toLocaleString()}`} icon={TrendingUp} trend="up" trendValue="+20.1% from last month" />
+        <DataCard title="Total Expenses" value={`${currencySymbol}${(financialData?.totalExpenses ?? 0).toLocaleString()}`} icon={TrendingDown} trend="neutral" trendValue="+12% from last month" />
+        <DataCard title="Net Profit" value={`${currencySymbol}${(financialData?.netProfit ?? 0).toLocaleString()}`} icon={Wallet} trend="up" trendValue="+15% from last month" />
+        <DataCard title="Employees" value={`${(financialData?.employeeCount ?? 0).toLocaleString()}`} icon={Users} />
       </div>
 
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
-         <Card className="shadow-lg">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <Card className="lg:col-span-2 shadow-lg">
           <CardHeader>
             <CardTitle className="font-headline">Revenue vs Expenses</CardTitle>
-            <CardDescription>Monthly breakdown</CardDescription>
+            <CardDescription>Monthly overview for the last 6 months.</CardDescription>
           </CardHeader>
-          <CardContent className="h-[300px] sm:h-[350px]">
+          <CardContent className="h-[350px]">
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={mockChartData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                <XAxis dataKey="name" stroke="hsl(var(--muted-foreground))" fontSize={12} />
-                <YAxis stroke="hsl(var(--muted-foreground))" fontSize={12} tickFormatter={(value) => `${currency}${value/1000}k`} />
+              <BarChart data={monthlyChartData}>
+                <XAxis dataKey="month" stroke="#888888" fontSize={12} tickLine={false} axisLine={false} />
+                <YAxis stroke="#888888" fontSize={12} tickLine={false} axisLine={false} tickFormatter={(value) => `${currencySymbol}${value / 1000}k`} />
                 <Tooltip
-                  contentStyle={{ backgroundColor: 'hsl(var(--background))', border: '1px solid hsl(var(--border))', borderRadius: 'var(--radius)'}}
-                  labelStyle={{ color: 'hsl(var(--foreground))' }}
-                  itemStyle={{ color: 'hsl(var(--foreground))' }}
+                    contentStyle={{
+                        backgroundColor: 'hsl(var(--background))',
+                        borderColor: 'hsl(var(--border))',
+                        borderRadius: 'var(--radius)',
+                    }}
+                    cursor={{ fill: 'hsl(var(--muted))' }}
                 />
-                <Legend wrapperStyle={{fontSize: '12px'}} />
+                <Legend iconType="circle" iconSize={10} />
                 <Bar dataKey="revenue" fill="hsl(var(--accent))" name="Revenue" radius={[4, 4, 0, 0]} />
                 <Bar dataKey="expenses" fill="hsl(var(--primary))" name="Expenses" radius={[4, 4, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
           </CardContent>
         </Card>
-        
-        <Card className="shadow-lg">
-          <CardHeader>
-            <CardTitle className="font-headline">Quick Stats</CardTitle>
-          </CardHeader>
-          <CardContent className="grid gap-4">
-              <div className="flex items-center justify-between p-3 bg-background rounded-lg border">
-                <div>
-                    <p className="text-sm text-muted-foreground">New Customers</p>
-                    <p className="text-2xl font-bold">{newCustomers}</p>
-                </div>
-                <Users className="h-8 w-8 text-primary" />
-              </div>
-              <div className="flex items-center justify-between p-3 bg-background rounded-lg border">
-                <div>
-                    <p className="text-sm text-muted-foreground">Active Projects</p>
-                    <p className="text-2xl font-bold">{activeProjects}</p>
-                </div>
-                <Activity className="h-8 w-8 text-accent" />
-              </div>
-               <div className="flex items-center justify-between p-3 bg-background rounded-lg border">
-                 <div>
-                    <p className="text-sm text-muted-foreground">Pending Invoices</p>
-                    <p className="text-2xl font-bold">3</p>
-                 </div>
-                 <FileText className="h-8 w-8 text-destructive" />
-              </div>
-          </CardContent>
-        </Card>
+
+        <TransactionPieChart />
       </div>
 
-      <div className="grid gap-4 md:grid-cols-2">
-        <Card className="shadow-lg">
-          <CardHeader>
-            <CardTitle className="font-headline">Recent Activity</CardTitle>
-            <CardDescription>Latest updates and actions.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <ul className="space-y-3">
-              {mockRecentActivity.map(activity => (
-                <li key={activity.id} className="flex items-start gap-3 p-3 bg-background rounded-lg border">
-                  <div className={`mt-1 flex-shrink-0 h-3 w-3 rounded-full ${activity.type === 'payment' ? 'bg-accent' : activity.type === 'expense' ? 'bg-destructive' : 'bg-primary'}`}></div>
-                  <div>
-                    <p className="text-sm text-foreground">{activity.description}</p>
-                    <p className="text-xs text-muted-foreground">{activity.time}</p>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          </CardContent>
-        </Card>
-        <HelpfulTipsCard />
-      </div>
+       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <Card className="lg:col-span-2 shadow-lg">
+                <CardHeader>
+                    <CardTitle className="font-headline">Recent Activity</CardTitle>
+                    <CardDescription>Latest invoices and expenses recorded.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                    <Table>
+                        <TableCaption>{recentActivity.length === 0 ? "No recent activity." : "A list of your most recent transactions."}</TableCaption>
+                        <TableHeader>
+                        <TableRow>
+                            <TableHead>Description</TableHead>
+                            <TableHead>Date</TableHead>
+                            <TableHead>Status</TableHead>
+                            <TableHead className="text-right">Amount</TableHead>
+                        </TableRow>
+                        </TableHeader>
+                        <TableBody>
+                        {recentActivity.map((activity) => (
+                            <TableRow key={activity.id}>
+                            <TableCell className="font-medium">{activity.description}</TableCell>
+                            <TableCell>{format(activity.date, 'PP')}</TableCell>
+                            <TableCell>
+                                <Badge variant="outline" className={getStatusBadgeVariant(activity.status)}>
+                                    {activity.status}
+                                </Badge>
+                            </TableCell>
+                            <TableCell className={`text-right font-semibold ${activity.type === 'invoice' ? 'text-accent' : 'text-destructive'}`}>
+                                {activity.type === 'invoice' ? '+' : '-'}{currencySymbol}{activity.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                            </TableCell>
+                            </TableRow>
+                        ))}
+                        </TableBody>
+                    </Table>
+                </CardContent>
+            </Card>
+
+            <HelpfulTipsCard />
+        </div>
+
     </div>
   );
 }

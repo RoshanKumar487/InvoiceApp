@@ -1,8 +1,9 @@
+
 'use client';
 
 import type { User as FirebaseUser, AuthError } from 'firebase/auth';
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
-import { auth, db } from '@/lib/firebaseConfig'; // Import db
+import { auth, db } from '@/lib/firebaseConfig';
 import {
   onAuthStateChanged,
   createUserWithEmailAndPassword,
@@ -11,34 +12,43 @@ import {
   updateProfile,
   sendPasswordResetEmail,
 } from 'firebase/auth';
-import { doc, setDoc, serverTimestamp, getDoc } from 'firebase/firestore'; // Import Firestore functions
+import { doc, setDoc, serverTimestamp, getDoc, collection, addDoc } from 'firebase/firestore';
 import { useRouter, usePathname } from 'next/navigation';
 import { useToast } from '@/hooks/use-toast';
 import { getCurrencySymbol } from '@/lib/countries';
+
+type UserRole = 'admin' | 'member' | 'pending' | 'rejected';
 
 interface User {
   uid: string;
   email: string | null;
   displayName: string | null;
-  companyId: string;
-  country?: string; // Add country
-  currencySymbol: string; // Add currency symbol
+  companyId: string | null; // A user might not have a companyId until approved
+  country?: string;
+  currencySymbol: string;
+  role: UserRole;
+}
+
+interface SignUpCompanyInfo {
+  id?: string; // Exists if joining an existing company
+  name: string;
+  address: string;
+  city: string;
+  stateOrProvince: string;
+  country: string;
 }
 
 interface AuthContextType {
   user: User | null;
   isLoading: boolean;
   error: AuthError | null;
+  currencySymbol: string;
   signUp: (
     email: string,
     password: string,
-    displayName: string, // User's full name
-    companyName: string,
-    companyAddress: string,
-    city: string,
-    stateOrProvince: string,
-    country: string, // Add country
-  ) => Promise<FirebaseUser | null>;
+    displayName: string,
+    companyInfo: SignUpCompanyInfo
+  ) => Promise<{ user: FirebaseUser | null; status: 'approved' | 'pending' }>;
   signIn: (email: string, password: string) => Promise<FirebaseUser | null>;
   signOut: () => Promise<void>;
   sendPasswordReset: (email: string) => Promise<void>;
@@ -46,14 +56,10 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-const getDerivedCompanyId = (uid: string): string => {
-  return `fb-default-company-${uid.slice(0, 10)}`; // Increased length for more uniqueness
-};
-
 export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [user, setUser] = useState<User | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [authError, setAuthError] = useState<AuthError | null>(null); // Renamed to avoid conflict with JS Error
+  const [authError, setAuthError] = useState<AuthError | null>(null);
   const router = useRouter();
   const pathname = usePathname();
   const { toast } = useToast();
@@ -61,35 +67,55 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       if (firebaseUser) {
-        const companyId = getDerivedCompanyId(firebaseUser.uid);
-        
-        // Fetch company profile to get country and determine currency
-        let userCountry: string | undefined = undefined;
-        try {
-          const companyDocRef = doc(db, 'companyProfiles', companyId);
-          const companyDocSnap = await getDoc(companyDocRef);
-          if (companyDocSnap.exists()) {
-            userCountry = companyDocSnap.data()?.country;
+        const userDocRef = doc(db, 'users', firebaseUser.uid);
+        const userDocSnap = await getDoc(userDocRef);
+
+        if (userDocSnap.exists()) {
+          const userData = userDocSnap.data();
+          const companyId = userData.companyId;
+
+          // Super admin check
+          const isSuperAdmin = firebaseUser.email === 'roshankumar70975@gmail.com';
+          const userRole: UserRole = isSuperAdmin ? 'admin' : userData.role || 'pending';
+
+          let userCountry: string | undefined = undefined;
+          if (companyId) {
+            try {
+              const companyDocRef = doc(db, 'companyProfiles', companyId);
+              const companyDocSnap = await getDoc(companyDocRef);
+              if (companyDocSnap.exists()) {
+                userCountry = companyDocSnap.data()?.country;
+              }
+            } catch (e) {
+              console.error("AuthContext: Could not fetch company profile for currency.", e);
+            }
           }
-        } catch (e) {
-            console.error("AuthContext: Could not fetch company profile for currency.", e);
-        }
-
-        const currencySymbol = getCurrencySymbol(userCountry);
-
-        const appUser: User = {
-          uid: firebaseUser.uid,
-          email: firebaseUser.email,
-          displayName: firebaseUser.displayName,
-          companyId: companyId,
-          country: userCountry,
-          currencySymbol: currencySymbol,
-        };
-        setUser(appUser);
-        console.log(`AuthContext: User authenticated. UID: ${firebaseUser.uid}, CompanyID: ${companyId}, Currency: ${currencySymbol}`);
-        const authPages = ['/auth/signin', '/auth/signup'];
-        if (authPages.includes(pathname)) {
-          router.push('/');
+          const currencySymbol = getCurrencySymbol(userCountry);
+          
+          const appUser: User = {
+            uid: firebaseUser.uid,
+            email: firebaseUser.email,
+            displayName: firebaseUser.displayName,
+            companyId: companyId || null,
+            country: userCountry,
+            currencySymbol: currencySymbol,
+            role: userRole,
+          };
+          setUser(appUser);
+          
+          if (isSuperAdmin) {
+            console.log(`AuthContext: Super admin authenticated. UID: ${firebaseUser.uid}`);
+          } else {
+            console.log(`AuthContext: User authenticated. UID: ${firebaseUser.uid}, Role: ${appUser.role}`);
+          }
+          
+          const authPages = ['/auth/signin', '/auth/signup'];
+          if (authPages.includes(pathname)) {
+            router.push('/');
+          }
+        } else {
+          setUser(null);
+          console.log('AuthContext: Firebase user exists, but no user document found in Firestore. Possibly pending approval.');
         }
       } else {
         setUser(null);
@@ -108,8 +134,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   }, [toast, router, pathname]);
 
   useEffect(() => {
-    const publicPaths = ['/auth/signin', '/auth/signup'];
-    const isAuthPage = publicPaths.includes(pathname);
+    const publicPaths = ['/auth/signin', '/auth/signup', '/auth/forgot-password'];
+    const isAuthPage = publicPaths.some(path => pathname.startsWith(path));
 
     if (!isLoading && !user && !isAuthPage) {
       console.log(`AuthContext: Redirecting to /auth/signin from ${pathname}`);
@@ -121,52 +147,56 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     email: string,
     password: string,
     displayName: string,
-    companyName: string,
-    companyAddress: string,
-    city: string,
-    stateOrProvince: string,
-    country: string
-  ): Promise<FirebaseUser | null> => {
+    companyInfo: SignUpCompanyInfo
+  ): Promise<{ user: FirebaseUser | null; status: 'approved' | 'pending' }> => {
     setIsLoading(true);
     setAuthError(null);
     try {
       const userCredential = await createUserWithEmailAndPassword(auth, email, password);
       const firebaseUser = userCredential.user;
-      
-      // Update Firebase Auth user profile with displayName (Full Name)
-      if (displayName && firebaseUser) {
-        await updateProfile(firebaseUser, { displayName });
-      }
+      await updateProfile(firebaseUser, { displayName });
 
-      // Create company profile in Firestore
-      const companyId = getDerivedCompanyId(firebaseUser.uid);
-      const companyProfileData = {
-        name: companyName,
-        address: companyAddress,
-        city: city,
-        state: stateOrProvince,
-        country: country, // Save country
-        gstin: '', // Initialize empty
-        phone: '', // Initialize empty
-        email: firebaseUser.email || '', // Pre-fill with user's email
-        website: '', // Initialize empty
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      };
-      const companyDocRef = doc(db, 'companyProfiles', companyId);
-      await setDoc(companyDocRef, companyProfileData);
-      
-      console.log('AuthContext: User signed up & company profile created:', firebaseUser.uid, 'CompanyId:', companyId);
-      toast({ title: "Sign Up Successful", description: "Welcome! Your company profile has been initiated." });
-      // User state will be updated by onAuthStateChanged, which also handles initial redirect.
-      return firebaseUser;
+      if (companyInfo.id) { // Joining an existing company
+        const userDocRef = doc(db, 'users', firebaseUser.uid);
+        await setDoc(userDocRef, {
+          uid: firebaseUser.uid, email: firebaseUser.email, displayName,
+          companyId: companyInfo.id, role: 'pending', createdAt: serverTimestamp(),
+        });
+
+        await addDoc(collection(db, 'accessRequests'), {
+          userId: firebaseUser.uid, userName: displayName, userEmail: email,
+          companyId: companyInfo.id, companyName: companyInfo.name, status: 'pending',
+          createdAt: serverTimestamp(),
+        });
+        
+        console.log('AuthContext: User requested to join company:', companyInfo.id);
+        await firebaseSignOut(auth);
+        return { user: firebaseUser, status: 'pending' };
+      } else { // Creating a new company
+        const newCompanyDocRef = doc(collection(db, 'companyProfiles'));
+        await setDoc(newCompanyDocRef, {
+          name: companyInfo.name, address: companyInfo.address, city: companyInfo.city,
+          state: companyInfo.stateOrProvince, country: companyInfo.country,
+          gstin: '', phone: '', email: firebaseUser.email || '', website: '',
+          adminUserId: firebaseUser.uid, createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
+        });
+        
+        const userDocRef = doc(db, 'users', firebaseUser.uid);
+        await setDoc(userDocRef, {
+          uid: firebaseUser.uid, email: firebaseUser.email, displayName,
+          companyId: newCompanyDocRef.id, role: 'admin', createdAt: serverTimestamp(),
+        });
+        
+        console.log('AuthContext: New company created by admin:', firebaseUser.uid, 'CompanyId:', newCompanyDocRef.id);
+        toast({ title: "Sign Up Successful", description: "Welcome! Your company and admin account have been created." });
+        return { user: firebaseUser, status: 'approved' };
+      }
     } catch (err) {
       const caughtError = err as AuthError;
-      console.error('AuthContext: Sign up error', caughtError);
       setAuthError(caughtError);
       toast({ title: "Sign Up Failed", description: caughtError.message, variant: "destructive"});
       setIsLoading(false);
-      return null;
+      return { user: null, status: 'approved' };
     }
   };
 
@@ -175,15 +205,41 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     setAuthError(null);
     try {
       const userCredential = await signInWithEmailAndPassword(auth, email, password);
-      const companyId = getDerivedCompanyId(userCredential.user.uid);
-      console.log('AuthContext: User signed in successfully:', userCredential.user.uid, 'CompanyId:', companyId);
+
+      // Super admin check
+      if (userCredential.user.email !== 'roshankumar70975@gmail.com') {
+        // Check user role from firestore for non-super-admins
+        const userDocRef = doc(db, 'users', userCredential.user.uid);
+        const userDocSnap = await getDoc(userDocRef);
+        if (!userDocSnap.exists() || userDocSnap.data().role === 'pending' || userDocSnap.data().role === 'rejected') {
+          const role = userDocSnap.exists() ? userDocSnap.data().role : 'unknown';
+          let message = "Your account is not yet active. Please wait for admin approval.";
+          if (role === 'rejected') {
+              message = "Your request to join the company was rejected.";
+          } else if (role === 'unknown') {
+              message = "Your user profile could not be found. Please sign up first."
+          }
+          await firebaseSignOut(auth);
+          toast({ title: "Sign In Failed", description: message, variant: "destructive"});
+          setIsLoading(false);
+          return null;
+        }
+      }
+
+      console.log('AuthContext: User signed in successfully:', userCredential.user.uid);
       toast({ title: "Sign In Successful", description: "Welcome back!"});
+      // onAuthStateChanged will handle setting user state
       return userCredential.user;
     } catch (err) {
       const caughtError = err as AuthError;
-      console.error('AuthContext: Sign in error', caughtError);
       setAuthError(caughtError);
-      toast({ title: "Sign In Failed", description: caughtError.message, variant: "destructive"});
+
+      let errorMessage = caughtError.message;
+      if (caughtError.code === 'auth/invalid-credential') {
+        errorMessage = 'Invalid credentials. Please check your email and password, or sign up if you are a new user.';
+      }
+      
+      toast({ title: "Sign In Failed", description: errorMessage, variant: "destructive"});
       setIsLoading(false);
       return null;
     }
@@ -197,7 +253,6 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       toast({ title: "Signed Out", description: "You have been successfully signed out."});
     } catch (err) {
       const caughtError = err as AuthError;
-      console.error('AuthContext: Sign out error', caughtError);
       setAuthError(caughtError);
       toast({ title: "Sign Out Failed", description: caughtError.message, variant: "destructive"});
     }
@@ -207,17 +262,17 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     setAuthError(null);
     try {
       await sendPasswordResetEmail(auth, email);
-      toast({ title: "Password Reset Email Sent", description: "Check your inbox for instructions." });
     } catch (err) {
       const caughtError = err as AuthError;
-      console.error('AuthContext: Password reset error', caughtError);
       setAuthError(caughtError);
-      toast({ title: "Password Reset Failed", description: caughtError.message, variant: "destructive"});
+      throw caughtError;
     }
   };
 
+  const currencySymbol = user?.currencySymbol || '$';
+
   return (
-    <AuthContext.Provider value={{ user, isLoading, error: authError, signUp, signIn, signOut, sendPasswordReset }}>
+    <AuthContext.Provider value={{ user, isLoading, error: authError, currencySymbol, signUp, signIn, signOut, sendPasswordReset }}>
       {children}
     </AuthContext.Provider>
   );

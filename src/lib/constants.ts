@@ -1,6 +1,5 @@
-
 import type { LucideIcon } from 'lucide-react';
-import { LayoutDashboard, CalendarDays, TrendingUp, TrendingDown, Sparkles, Receipt, Users2, FileBarChart } from 'lucide-react';
+import { LayoutDashboard, TrendingUp, TrendingDown, Sparkles, Receipt, Users, FileBarChart, Shield, HelpCircle, Banknote, Building } from 'lucide-react';
 
 export interface NavItem {
   label: string;
@@ -13,11 +12,6 @@ export const NAV_ITEMS: NavItem[] = [
     label: 'Dashboard',
     href: '/',
     icon: LayoutDashboard,
-  },
-  {
-    label: 'Calendar',
-    href: '/calendar',
-    icon: CalendarDays,
   },
   {
     label: 'Record Revenue',
@@ -40,13 +34,28 @@ export const NAV_ITEMS: NavItem[] = [
     icon: Receipt,
   },
   {
+    label: 'Bank Accounts',
+    href: '/bank-accounts',
+    icon: Banknote,
+  },
+  {
     label: 'Employees',
     href: '/employees',
-    icon: Users2,
+    icon: Users,
   },
   {
     label: 'Reports',
     href: '/reports',
     icon: FileBarChart,
+  },
+  {
+    label: 'Administration',
+    href: '/admin',
+    icon: Shield,
+  },
+  {
+    label: 'Guide',
+    href: '/guide',
+    icon: HelpCircle,
   }
 ];
